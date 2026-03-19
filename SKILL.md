@@ -1,0 +1,1049 @@
+---
+name: rust-nif
+description: >
+  Rust NIFs with Rustler for Elixir — safe native code, BEAM/OTP integration,
+  error handling, scheduler management, and process communication.
+  ALWAYS use when writing Rust NIFs or Rustler code.
+  ALWAYS use when integrating native Rust code with Elixir/BEAM.
+  ALWAYS use when debugging NIF performance, crashes, or type conversion issues.
+---
+
+# Rust NIFs with Rustler
+
+## 1. Rules for Writing Rust NIFs (LLM)
+
+1. **ALWAYS use dirty schedulers** for operations >1ms — normal scheduler NIFs must complete in <1ms or they block the BEAM
+   ```rust
+   #[rustler::nif(schedule = "DirtyCpu")]  // CPU work
+   #[rustler::nif(schedule = "DirtyIo")]   // I/O work
+   ```
+
+2. **NEVER return `Result<Atom, Atom>` where `Ok` wraps `:ok`** — this creates `{:ok, :ok}` double-wrapping on the Elixir side. Return `Atom` directly for void-like operations, or return a meaningful value in `Ok`
+   ```rust
+   // BAD: produces {:ok, :ok} in Elixir
+   fn insert(set: ResourceArc<Set>, val: i64) -> Result<Atom, Atom> {
+       // ...
+       Ok(atoms::ok())  // Elixir sees {:ok, :ok}
+   }
+   // GOOD: return the meaningful value, or use Atom directly
+   fn insert(set: ResourceArc<Set>, val: i64) -> Result<bool, Atom> {
+       // ...
+       Ok(true)  // Elixir sees {:ok, true}
+   }
+   // GOOD: for void operations that can't fail, just return Atom
+   fn insert(set: ResourceArc<Set>, val: i64) -> Atom {
+       // ...
+       atoms::ok()  // Elixir sees :ok
+   }
+   ```
+
+3. **ALWAYS return Result types** instead of panicking — a panic in a NIF crashes the entire BEAM VM
+   ```rust
+   fn example() -> Result<T, Atom>  // Not T directly if it can fail
+   ```
+
+4. **ALWAYS use try_lock()** for ResourceArc mutex access, not lock() — blocking locks can deadlock the scheduler
+   ```rust
+   match resource.data.try_lock() {
+       Some(guard) => Ok(process(&guard)),
+       None => Err(atoms::lock_fail()),
+   }
+   ```
+
+5. **ALWAYS use derive macros** for Elixir ↔ Rust type conversion
+   ```rust
+   #[derive(NifStruct)]       // %Module{}
+   #[derive(NifMap)]          // %{key: value}  (requires ALL keys present!)
+   #[derive(NifTaggedEnum)]   // :atom | {:tag, value}
+   #[derive(NifUnitEnum)]     // :atom
+   ```
+
+6. **NEVER use `unwrap()` or `expect()`** in NIF code — convert to Result with `.ok_or()` or `?` operator
+
+7. **ALWAYS design the Elixir API first** — write how you want to call it from Elixir, then implement the Rust NIF to match
+
+8. **ALWAYS split NIF wrappers from pure logic** — NIF functions should be thin wrappers; test the internal logic with `cargo test`, test the NIF integration with ExUnit
+
+9. **PREFER Rayon** for data parallelism over manual thread management
+   ```rust
+   use rayon::prelude::*;
+   data.par_iter().map(|x| process(x)).collect()
+   ```
+
+10. **ALWAYS use `parking_lot::Mutex`** over `std::sync::Mutex` — faster, smaller, no poisoning
+
+11. **PREFER Elixir for network I/O** — only use Rust NIFs when you need a Rust-only library, heavy CPU processing of network data, or custom binary protocol parsing
+
+12. **ALWAYS benchmark before assuming** a NIF is faster — the overhead of crossing the NIF boundary can negate small gains
+
+13. **ALWAYS drop MutexGuards before expensive work** — hold locks for the minimum duration
+    ```rust
+    let value = {
+        let guard = res.data.try_lock().ok_or(atoms::lock_fail())?;
+        guard.clone()
+    }; // Guard dropped here
+    expensive_work(value); // Lock free
+    ```
+
+14. **NEVER call `send_and_clear()` from a BEAM-managed thread** — it will panic. Only use from `std::thread::spawn` or similar
+
+15. **ALWAYS wrap NifMap NIFs** in Elixir functions that fill missing keys with `nil` — NifMap requires ALL keys present even for `Option<T>` fields
+
+16. **ALWAYS add `@spec` to every NIF binding function** — NIF stubs are the boundary between two type systems and are the most important functions to type. Every `def func(...), do: :erlang.nif_error(:nif_not_loaded)` must have a `@spec` above it. Define shared `@type` aliases when multiple NIFs take the same complex argument pattern
+    ```elixir
+    # Define shared types for recurring NIF argument patterns
+    @type point :: {float(), float()}
+
+    @spec my_nif(arg_type(), other_type()) :: {:ok, result_type()} | {:error, String.t()}
+    def my_nif(_arg, _other), do: :erlang.nif_error(:nif_not_loaded)
+
+    # Multi-line @spec for functions with many parameters
+    @spec compute(
+            [[float()]],
+            non_neg_integer(),
+            [point()]
+          ) :: {:ok, map()} | {:error, String.t()}
+    def compute(_matrix, _window, _points), do: :erlang.nif_error(:nif_not_loaded)
+    ```
+
+## 2. When to Use Rust NIFs
+
+### Good Use Cases
+
+| Use Case | Why NIF? | Examples |
+|----------|----------|----------|
+| CPU-intensive computation | BEAM not optimized for number crunching | Image processing, crypto, compression |
+| Large data structures | Rust's memory layout more efficient | Discord's SortedSet (11M users) |
+| Specific Rust libraries | No Elixir equivalent | Polars, tokenizers, parsers |
+| Performance-critical paths | 10x-100x speedup possible | JSON parsing, binary protocols |
+
+### Performance Thresholds
+
+```
+Operation Time       | Recommendation
+---------------------|----------------------------------
+< 1 microsecond      | Probably not worth NIF overhead
+1-100 microseconds   | Maybe, benchmark first
+100 μs - 1 ms        | Good candidate for regular NIF
+1-10 ms              | Use DirtyCpu scheduler
+10-100 ms            | Use dirty scheduler + chunking
+100+ ms              | Consider Port or yielding NIF
+```
+
+### When NOT to Use NIFs
+
+1. **I/O-bound work** — Elixir's async model is better
+2. **Simple transforms** — overhead of NIF call > savings
+3. **Fault tolerance requirements** — NIF crash = entire VM crash (use Ports for isolation)
+4. **Prototyping** — Rust has slower iteration than Elixir
+
+| Alternative | Use When | Trade-off |
+|-------------|----------|-----------|
+| Port | Need isolation from crashes | Slower (IPC overhead) |
+| :os.cmd | Simple scripts | Very slow, security risk |
+| Task.async | Parallel Elixir | Limited by BEAM |
+| Flow/Broadway | Data pipelines | Good for I/O, not CPU |
+
+## 3. Rust Fundamentals for NIFs
+
+### Ownership Rules (Critical for NIFs)
+```rust
+// Values have ONE owner - when owner goes out of scope, value is dropped
+let s1 = String::from("hello");
+let s2 = s1;  // s1 is MOVED, no longer valid
+
+// Borrow instead of move
+let s1 = String::from("hello");
+let len = calculate_length(&s1);  // Borrow with &
+println!("{}", s1);  // s1 still valid
+```
+
+### Move Semantics with Closures (Critical for Threads)
+```rust
+// Thread closures MUST use `move` to take ownership
+let data = vec![1, 2, 3];
+thread::spawn(move || {
+    // data is MOVED here - thread might outlive parent
+    process(data)
+});
+// data no longer valid here!
+```
+
+### Lifetime Annotations
+```rust
+// 'a - tied to Env lifetime (NIF call duration)
+fn example<'a>(env: Env<'a>) -> Term<'a> { ... }
+
+// 'static - lives forever (required for spawned threads)
+pub fn spawn<F, T>(f: F) -> JoinHandle<T>
+where
+    F: FnOnce() -> T + Send + 'static,
+    T: Send + 'static,
+// This is why we use `move` closures in NIFs
+```
+
+### String Types in NIFs
+```rust
+// String: heap-allocated, owned, mutable - use for return values
+#[rustler::nif]
+fn process_string(input: String) -> String {
+    input.to_uppercase()
+}
+
+// &str: borrowed view, zero-copy from Elixir - use for read-only
+#[rustler::nif]
+fn count_chars(input: &str) -> usize {
+    input.chars().count()
+}
+
+// Binary: zero-copy bytes from Elixir - most efficient for raw data
+#[rustler::nif]
+fn binary_length(data: Binary) -> usize {
+    data.len()  // No copy!
+}
+
+// NewBinary: allocate BEAM binary, write into it, return without copy
+// Use this instead of Vec<u8> when returning large binary data
+#[rustler::nif]
+fn compress(env: Env, data: Binary) -> Binary {
+    let compressed = do_compress(data.as_slice());
+    let mut output = NewBinary::new(env, compressed.len());
+    output.as_mut_slice().copy_from_slice(&compressed);
+    output.into()  // Converts to Binary — zero-copy return to Elixir
+}
+```
+
+**Binary type selection:** `Binary` for reading input (zero-copy), `NewBinary` for writing output (allocates in BEAM heap, no copy on return), `Vec<u8>` only for intermediate Rust-side buffers.
+
+### Error Handling (Never Panic!)
+```rust
+// BAD - panic crashes the BEAM!
+fn bad_divide(a: i64, b: i64) -> i64 {
+    a / b  // Panics on divide by zero!
+}
+
+// GOOD - return Result
+fn good_divide(a: i64, b: i64) -> Result<i64, String> {
+    if b == 0 {
+        Err("division by zero".to_string())
+    } else {
+        Ok(a / b)
+    }
+}
+```
+
+### Thread Safety Requirements
+NIF resources must be `Send + Sync`:
+```rust
+use std::sync::Mutex;
+
+// Thread-safe wrapper for state
+struct MyResource {
+    data: Mutex<Vec<String>>,  // Mutex provides Sync
+}
+// ResourceArc<T> requires T: Send + Sync
+```
+
+### Smart Pointers for NIFs
+
+| Type | Use Case | Notes |
+|------|----------|-------|
+| `Arc<T>` | Shared ownership across threads | ResourceArc uses this internally |
+| `Mutex<T>` | Exclusive access | Blocks on contention |
+| `RwLock<T>` | Multiple readers OR one writer | Better for read-heavy workloads |
+| `Box<T>` | Heap allocation | Single owner |
+
+Prefer `parking_lot::Mutex` over `std::sync::Mutex` (faster, smaller, no poisoning)
+
+## 4. Rustler Project Setup
+
+### Step 1: Add Dependencies
+```elixir
+# mix.exs
+defp deps do
+  [
+    {:rustler, "~> 0.37.2", runtime: false}
+  ]
+end
+```
+
+### Step 2: Generate NIF
+```bash
+mix deps.get
+mix rustler.new
+# Enter module name: MyApp.Native
+# Enter NIF name: my_nif
+```
+
+### Step 3: Cargo.toml Configuration
+```toml
+[package]
+name = "my_nif"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "my_nif"
+crate-type = ["cdylib"]
+
+[dependencies]
+rustler = "0.37.2"
+
+# Common additions:
+# thiserror = "2.0"      # Error handling
+# parking_lot = "0.12"   # Faster Mutex
+# rayon = "1.10"         # Parallelism
+```
+
+### Step 4: Basic NIF Structure
+```rust
+// native/my_nif/src/lib.rs
+#[rustler::nif]
+fn add(a: i64, b: i64) -> i64 {
+    a + b
+}
+
+// Rename the Elixir-facing function (Rust name differs from Elixir name)
+#[rustler::nif(name = "compute_sum")]
+fn internal_sum(a: i64, b: i64) -> i64 {
+    a + b
+}
+
+rustler::init!("Elixir.MyApp.Native");
+
+// With load callback — runs once when NIF is loaded (setup global state, validate)
+// rustler::init!("Elixir.MyApp.Native", load = on_load);
+// fn on_load(env: Env, _info: Term) -> bool {
+//     // Return true to indicate successful load, false aborts
+//     true
+// }
+```
+
+### Step 5: Elixir Module
+```elixir
+defmodule MyApp.Native do
+  use Rustler,
+    otp_app: :my_app,
+    crate: "my_nif"
+
+  # Every NIF binding MUST have a @spec — it's the boundary between two type systems
+  @spec add(integer(), integer()) :: integer()
+  def add(_a, _b), do: :erlang.nif_error(:nif_not_loaded)
+end
+```
+
+## 5. Type Encoding/Decoding
+
+### Type Mapping Table
+
+| Elixir | Rust | Notes |
+|--------|------|-------|
+| `integer` | `i64`, `i32`, `u64`, etc. | Use appropriate size |
+| `float` | `f64`, `f32` | f64 preferred |
+| `String.t()` | `String` | UTF-8, heap allocated |
+| `binary` | `Binary` | Zero-copy read from Elixir |
+| `binary` | `NewBinary` | Efficient write — allocate BEAM binary |
+| `binary` | `Vec<u8>` | Copies data (use NewBinary instead) |
+| `atom` | `Atom` | Interned strings |
+| `list` | `Vec<T>` | Converted to Vec |
+| `map` | `HashMap<K,V>` | Or struct with NifMap |
+| `tuple` | `(A, B, ...)` | Or struct with NifTuple |
+| `nil` | `()` | Unit type |
+| `pid` | `LocalPid` | Process identifier |
+| `reference` | `Reference` | Unique reference |
+
+### Derive Macros
+
+```rust
+use rustler::{NifStruct, NifMap, NifTuple, NifTaggedEnum, NifUnitEnum};
+
+// Elixir: %MyApp.User{name: "Alice", age: 30}
+#[derive(NifStruct)]
+#[module = "MyApp.User"]
+struct User {
+    name: String,
+    age: i32,
+    email: Option<String>,  // Optional field
+}
+
+// Elixir: %{host: "localhost", port: 8080}
+#[derive(NifMap)]
+struct Config {
+    host: String,
+    port: i32,
+}
+
+// Elixir: {1, 2}
+#[derive(NifTuple)]
+struct Point(i32, i32);
+
+// Elixir: :ok | {:error, String} | {:pending, %{id: 1}}
+#[derive(NifTaggedEnum)]
+enum Status {
+    Ok,                      // :ok
+    Error(String),           // {:error, "message"}
+    Pending { id: i32 },     // {:pending, %{id: 1}}
+}
+
+// Elixir: :red | :green | :blue
+#[derive(NifUnitEnum)]
+enum Color {
+    Red,
+    Green,
+    Blue,
+}
+```
+
+### Atoms Macro
+```rust
+mod atoms {
+    rustler::atoms! {
+        ok,
+        error,
+        nil,
+        not_found,
+        invalid_input,
+        lock_fail,
+    }
+}
+
+// Usage
+fn example() -> Atom {
+    atoms::ok()
+}
+```
+
+## 6. Scheduler Safety Rules
+
+### The 1ms Rule
+NIFs on the normal scheduler MUST complete in under 1 millisecond. Longer NIFs block the scheduler and can cause:
+- Scheduler collapse
+- Process starvation
+- Unresponsive system
+
+### Scheduler Types
+
+```rust
+// Normal scheduler (default) - must complete in <1ms
+#[rustler::nif]
+fn fast_operation(x: i64) -> i64 {
+    x * 2
+}
+
+// DirtyCpu - for CPU-bound work (1ms - 100ms+)
+#[rustler::nif(schedule = "DirtyCpu")]
+fn heavy_computation(data: Vec<i64>) -> i64 {
+    data.iter().map(|x| expensive_calc(*x)).sum()
+}
+
+// DirtyIo - for I/O-bound work (file, network)
+#[rustler::nif(schedule = "DirtyIo")]
+fn read_file(path: String) -> Result<Vec<u8>, String> {
+    std::fs::read(&path).map_err(|e| e.to_string())
+}
+```
+
+## 7. Error Handling Patterns
+
+### Returning {:ok, value} / {:error, reason}
+```rust
+// Result<T, E> automatically converts to {:ok, T} / {:error, E}
+#[rustler::nif]
+fn safe_divide(a: f64, b: f64) -> Result<f64, String> {
+    if b == 0.0 {
+        Err("division by zero".to_string())
+    } else {
+        Ok(a / b)
+    }
+}
+// Elixir: {:ok, 5.0} or {:error, "division by zero"}
+```
+
+### Custom Atom Errors
+```rust
+#[rustler::nif]
+fn find_user(id: i32) -> Result<User, Atom> {
+    match lookup_user(id) {
+        Some(user) => Ok(user),
+        None => Err(atoms::not_found()),
+    }
+}
+// Elixir: {:ok, %User{}} or {:error, :not_found}
+```
+
+### Error Propagation with thiserror
+```rust
+// Add to Cargo.toml: thiserror = "2.0"
+use thiserror::Error;
+
+#[derive(Error, Debug)]
+enum NifError {
+    #[error("Parse error: {0}")]
+    Parse(#[from] std::num::ParseIntError),
+
+    #[error("IO error: {0}")]
+    Io(#[from] std::io::Error),
+
+    #[error("Lock contention")]
+    LockFail,
+
+    #[error("Not found: {0}")]
+    NotFound(String),
+}
+
+// Convert custom errors to Rustler errors
+impl From<NifError> for rustler::Error {
+    fn from(e: NifError) -> Self {
+        rustler::Error::Term(Box::new(e.to_string()))
+    }
+}
+
+#[rustler::nif]
+fn complex_operation(input: String) -> Result<i64, NifError> {
+    let value: i64 = input.parse()?;  // ? works with #[from]!
+
+    if value < 0 {
+        return Err(NifError::NotFound(input));
+    }
+
+    Ok(value * 2)
+}
+```
+
+### Option Handling Patterns
+```rust
+// Convert Option to Result (avoid unwrap!)
+#[rustler::nif]
+fn find_item(data: Vec<i64>, target: i64) -> Result<i64, Atom> {
+    data.iter()
+        .find(|&&x| x == target)
+        .copied()
+        .ok_or(atoms::not_found())
+}
+
+// Safe defaults with unwrap_or
+#[rustler::nif]
+fn get_or_default(data: Vec<i64>, index: usize) -> i64 {
+    data.get(index).copied().unwrap_or(-1)
+}
+```
+
+## 8. OTP Integration - Env and LocalPid
+
+### Sending Messages
+```rust
+#[rustler::nif]
+fn notify<'a>(env: Env<'a>, pid: LocalPid, message: Term<'a>) -> Atom {
+    match env.send(&pid, message) {
+        Ok(()) => atoms::ok(),
+        Err(_) => atoms::error(),
+    }
+}
+```
+
+### OwnedEnv for Async Operations
+
+`OwnedEnv` allows sending messages from threads NOT managed by the BEAM.
+
+```rust
+use rustler::env::OwnedEnv;
+use std::thread;
+
+#[rustler::nif]
+fn async_work<'a>(env: Env<'a>, data: String) -> Atom {
+    let pid = env.pid();  // Capture caller's PID
+
+    thread::spawn(move || {
+        let result = expensive_computation(&data);
+
+        let mut msg_env = OwnedEnv::new();
+        let _ = msg_env.send_and_clear(&pid, |env| {
+            (atoms::result(), result).encode(env)
+        });
+    });
+
+    atoms::ok()  // Return immediately
+}
+```
+
+**Critical:** `send_and_clear()` **PANICS** if called from a BEAM-managed thread. Only use from `std::thread::spawn`.
+
+## 9. ResourceArc for State Management
+
+For Rust state that persists across NIF calls:
+
+```rust
+use rustler::ResourceArc;
+use parking_lot::Mutex;
+
+struct Connection {
+    data: Mutex<Vec<String>>,
+}
+
+#[rustler::resource_impl]
+impl rustler::Resource for Connection {}
+
+#[rustler::nif]
+fn create_connection() -> ResourceArc<Connection> {
+    ResourceArc::new(Connection {
+        data: Mutex::new(Vec::new()),
+    })
+}
+
+#[rustler::nif]
+fn add_item(conn: ResourceArc<Connection>, item: String) -> Result<bool, Atom> {
+    match conn.data.try_lock() {
+        Some(mut data) => {
+            data.push(item);
+            Ok(true)
+        }
+        None => Err(atoms::lock_fail())
+    }
+}
+
+#[rustler::nif]
+fn get_items(conn: ResourceArc<Connection>) -> Result<Vec<String>, Atom> {
+    match conn.data.try_lock() {
+        Some(data) => Ok(data.clone()),
+        None => Err(atoms::lock_fail())
+    }
+}
+```
+
+### MutexGuard Lifetime Management
+
+Critical pattern to avoid holding locks during expensive operations:
+
+```rust
+// BAD: MutexGuard held too long
+#[rustler::nif]
+fn bad_long_lock(res: ResourceArc<MyRes>) -> i64 {
+    let guard = res.data.lock().unwrap();
+    let value = *guard;
+    expensive_computation();  // Guard still held - blocks other NIFs!
+    value
+}
+
+// GOOD: Drop guard before expensive work (scoped)
+#[rustler::nif]
+fn good_scoped_lock(res: ResourceArc<MyRes>) -> i64 {
+    let value = {
+        let guard = res.data.lock().unwrap();
+        *guard
+    }; // Guard dropped here
+
+    expensive_computation();  // Lock free, other NIFs can proceed
+    value
+}
+```
+
+### RwLock for Read-Heavy Workloads
+
+```rust
+use parking_lot::RwLock;
+
+struct DataFrame {
+    data: RwLock<Vec<Vec<f64>>>,
+}
+
+#[rustler::resource_impl]
+impl rustler::Resource for DataFrame {}
+
+#[rustler::nif]
+fn read_column(df: ResourceArc<DataFrame>, col: usize) -> Result<Vec<f64>, Atom> {
+    // Multiple NIFs can read simultaneously
+    let guard = df.data.try_read().ok_or(atoms::lock_fail())?;
+    guard.get(col).cloned().ok_or(atoms::not_found())
+}
+
+#[rustler::nif]
+fn add_column(df: ResourceArc<DataFrame>, data: Vec<f64>) -> Result<usize, Atom> {
+    // Write blocks all readers (exclusive access)
+    let mut guard = df.data.try_write().ok_or(atoms::lock_fail())?;
+    guard.push(data);
+    Ok(guard.len())  // Return meaningful value, not {:ok, :ok}
+}
+```
+
+## 10. Common Pitfalls & Anti-Patterns
+
+### Double-Wrapping {:ok, :ok} Tuples
+
+The most common Rustler gotcha. `Result<T, E>` auto-wraps in `{:ok, T}` / `{:error, E}`. If `T` is itself `:ok`, you get `{:ok, :ok}`.
+
+```rust
+// BAD - returns {:ok, :ok} in Elixir, requires awkward pattern matching
+#[rustler::nif]
+fn insert(set: ResourceArc<Set>, val: i64) -> Result<Atom, Atom> {
+    match set.data.try_lock() {
+        Some(mut data) => {
+            data.push(val);
+            Ok(atoms::ok())  // Elixir sees {:ok, :ok}
+        }
+        None => Err(atoms::lock_fail()),
+    }
+}
+
+// GOOD - return a meaningful value
+#[rustler::nif]
+fn insert(set: ResourceArc<Set>, val: i64) -> Result<usize, Atom> {
+    match set.data.try_lock() {
+        Some(mut data) => {
+            data.push(val);
+            Ok(data.len())  // Elixir sees {:ok, 5}
+        }
+        None => Err(atoms::lock_fail()),
+    }
+}
+
+// GOOD - if truly void, separate the error path
+#[rustler::nif]
+fn insert(set: ResourceArc<Set>, val: i64) -> Atom {
+    if let Some(mut data) = set.data.try_lock() {
+        data.push(val);
+        atoms::ok()       // Elixir sees :ok
+    } else {
+        atoms::lock_fail() // Elixir sees :lock_fail
+    }
+}
+```
+
+**Elixir workaround** when you can't change the NIF:
+```elixir
+def insert(set, value) do
+  case nif_insert(set, value) do
+    {:ok, :ok} -> :ok
+    {:error, reason} -> {:error, reason}
+  end
+end
+```
+
+**Rule of thumb:** Ask yourself what the Elixir caller actually wants to pattern match on. Design the return type to make that natural.
+
+### Blocking the Scheduler
+```rust
+// BAD - blocks scheduler for 5 seconds!
+#[rustler::nif]
+fn bad_sleep() {
+    std::thread::sleep(std::time::Duration::from_secs(5));
+}
+
+// GOOD - use dirty scheduler
+#[rustler::nif(schedule = "DirtyIo")]
+fn good_sleep() {
+    std::thread::sleep(std::time::Duration::from_secs(5));
+}
+```
+
+### Panicking
+```rust
+// BAD - crashes entire BEAM VM!
+#[rustler::nif]
+fn bad_unwrap(input: Option<i32>) -> i32 {
+    input.unwrap()  // Panics on None!
+}
+
+// GOOD - return Result
+#[rustler::nif]
+fn good_unwrap(input: Option<i32>) -> Result<i32, Atom> {
+    input.ok_or(atoms::not_found())
+}
+```
+
+### Deadlock with lock()
+```rust
+// BAD - can deadlock
+#[rustler::nif]
+fn bad_lock(res: ResourceArc<MyRes>) -> i32 {
+    let data = res.data.lock().unwrap();  // Blocks forever if locked!
+    *data
+}
+
+// GOOD - use try_lock
+#[rustler::nif]
+fn good_lock(res: ResourceArc<MyRes>) -> Result<i32, Atom> {
+    match res.data.try_lock() {
+        Some(data) => Ok(*data),
+        None => Err(atoms::lock_fail()),
+    }
+}
+```
+
+### NifMap Requires ALL Keys Present
+```rust
+#[derive(NifMap)]
+struct Opts {
+    color_mode: Option<ColorMode>,
+    filter_speckle: Option<i32>,
+}
+```
+```elixir
+# BAD - missing keys cause ArgumentError even though Rust fields are Option<T>
+MyNif.call(%{color_mode: :binary})
+
+# GOOD - wrap NIF to fill missing keys with nil
+@all_keys [:color_mode, :filter_speckle]
+def call(opts \\ %{}) do
+  full_opts = Map.merge(Map.new(@all_keys, &{&1, nil}), opts)
+  nif_call(full_opts)
+end
+```
+
+### Missing @spec on NIF Bindings
+
+NIF stubs are the boundary between Rust and Elixir type systems — they are the most important functions to type.
+
+```elixir
+# BAD - no @spec, caller has no idea what types the NIF expects or returns
+defmodule MyApp.Stats do
+  use Rustler, otp_app: :my_app, crate: "stats_nif"
+
+  def compute(_matrix, _window, _pairs), do: :erlang.nif_error(:nif_not_loaded)
+  def normalize(_values, _range), do: :erlang.nif_error(:nif_not_loaded)
+end
+
+# GOOD - @spec on every NIF, shared @type for recurring patterns
+defmodule MyApp.Stats do
+  use Rustler, otp_app: :my_app, crate: "stats_nif"
+
+  @type point :: {float(), float()}
+
+  @spec compute(
+          [[float()]],
+          non_neg_integer(),
+          [point()]
+        ) :: {:ok, map()} | {:error, String.t()}
+  def compute(_matrix, _window, _points), do: :erlang.nif_error(:nif_not_loaded)
+
+  @spec normalize([float()], {float(), float()}) :: {:ok, [float()]} | {:error, String.t()}
+  def normalize(_values, _range), do: :erlang.nif_error(:nif_not_loaded)
+end
+```
+
+**Why this matters:**
+- Dialyzer catches type mismatches at the NIF boundary before runtime
+- Editors show parameter types on hover — critical when the Rust side expects specific numeric types
+- When multiple NIFs share complex argument types (like `{float(), float()}` for coordinate pairs), a `@type` alias keeps specs readable and consistent
+
+### Inefficient String Conversion
+```rust
+// BAD - copies data
+#[rustler::nif]
+fn bad_binary(data: String) -> Vec<u8> {
+    data.into_bytes()
+}
+
+// GOOD - zero-copy with Binary
+#[rustler::nif]
+fn good_binary(data: Binary) -> usize {
+    data.as_slice().len()  // No copy!
+}
+```
+
+## 11. Resource Monitoring
+
+Monitor Elixir processes and react when they die:
+
+```rust
+use rustler::resource::Monitor;
+use parking_lot::Mutex;
+
+struct Session {
+    data: Mutex<Vec<String>>,
+}
+
+impl rustler::Resource for Session {
+    const IMPLEMENTS_DOWN: bool = true;
+
+    fn down<'a>(&'a self, _env: Env<'a>, pid: LocalPid, _mon: Monitor) {
+        println!("Process {:?} died, cleaning up...", pid);
+        if let Ok(mut data) = self.data.lock() {
+            data.clear();
+        }
+    }
+}
+
+#[rustler::resource_impl]
+impl Session {}
+
+#[rustler::nif]
+fn monitor_caller(env: Env, session: ResourceArc<Session>) -> bool {
+    let pid = env.pid();
+    env.monitor(&session, &pid).is_some()
+}
+```
+
+## 12. Testing NIFs
+
+### Rust Unit Tests
+For non-NIF logic, use standard Rust tests:
+```rust
+fn internal_compute(data: &[i64]) -> i64 {
+    data.iter().sum()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_compute() {
+        assert_eq!(internal_compute(&[1, 2, 3]), 6);
+    }
+}
+```
+
+### Elixir Integration Tests
+```elixir
+defmodule MyNifTest do
+  use ExUnit.Case
+
+  test "add returns correct sum" do
+    assert MyApp.Native.add(2, 3) == 5
+  end
+
+  test "safe_divide handles zero" do
+    assert {:error, "division by zero"} = MyApp.Native.safe_divide(1.0, 0.0)
+  end
+
+  test "async operation sends message" do
+    MyApp.Native.async_work("test")
+    assert_receive {:result, _}, 5000
+  end
+end
+```
+
+### Benchmarking with Benchee
+```elixir
+Mix.install([{:benchee, "~> 1.3"}])
+
+data = Enum.to_list(1..10_000)
+
+Benchee.run(%{
+  "Elixir Enum.sum" => fn -> Enum.sum(data) end,
+  "NIF sum" => fn -> MyApp.Native.sum_list(data) end
+})
+```
+
+**Note:** Build with `MIX_ENV=prod mix compile` for accurate benchmarks.
+
+## 13. Precompiled NIFs
+
+Distribute without requiring Rust on user machines:
+
+```elixir
+# mix.exs
+defp deps do
+  [
+    {:rustler, "~> 0.37.2", runtime: false},
+    {:rustler_precompiled, "~> 0.8"}
+  ]
+end
+```
+
+```elixir
+defmodule MyApp.Native do
+  version = Mix.Project.config()[:version]
+
+  use RustlerPrecompiled,
+    otp_app: :my_app,
+    crate: "my_nif",
+    base_url: "https://github.com/user/repo/releases/download/v#{version}",
+    version: version,
+    targets: ~w(
+      aarch64-apple-darwin
+      x86_64-apple-darwin
+      x86_64-unknown-linux-gnu
+      x86_64-unknown-linux-musl
+      aarch64-unknown-linux-gnu
+      x86_64-pc-windows-msvc
+    )
+
+  def add(_a, _b), do: :erlang.nif_error(:nif_not_loaded)
+end
+```
+
+## 14. API-First NIF Design
+
+Design your NIF interface first by writing how you WANT to use it:
+
+### Step 1: Design the Elixir Interface
+```elixir
+defmodule MyApp.ImageProcessor do
+  def process(image_data, opts \\ []) do
+    Native.process_image(image_data, opts)
+  end
+end
+```
+
+### Step 2: Write the NIF Signature to Match
+```rust
+#[rustler::nif(schedule = "DirtyCpu")]
+fn process_image(data: Binary, opts: ProcessOptions) -> Result<Vec<u8>, NifError> {
+    // Implementation follows the designed interface
+}
+```
+
+### Step 3: Write Tests That Use the Interface
+```rust
+#[test]
+fn process_image_returns_expected_result() {
+    let input = load_test_image();
+    let opts = ProcessOptions::default();
+    let result = process_image_internal(&input, &opts).unwrap();
+    assert!(result.len() > 0);
+}
+```
+
+## 15. Advanced Patterns Index
+
+> **Full implementations:** See [examples.md](examples.md) for complete working examples
+
+| Pattern | Purpose | examples.md |
+|---------|---------|-------------|
+| **Builder Pattern** | Complex config with fluent API and validation | §35 |
+| **State Pattern** | Type-state or enum-based state machines | §36 |
+| **Default Trait** | Sensible defaults with `unwrap_or_default()` | §41 |
+| **VecDeque Ring Buffer** | Circular buffers for sliding windows | §22 |
+| **Slab Handle Pool** | O(1) handle allocation/lookup (Discord pattern) | §23 |
+| **Custom Iterators** | Chunked data streaming from NIF resources | §27 |
+| **Custom Error Types** | thiserror-based errors with atom conversion | §32 |
+| **Drop Trait** | Resource cleanup on GC | §13 |
+| **RAII Guards** | Automatic transaction rollback on error/panic | §37 |
+| **Rayon Parallelism** | `par_iter()`, `par_chunks()`, work-stealing | §16 |
+| **OnceCell/Lazy** | Global lazy statics for expensive init | §21 |
+| **Bitflags** | C-compatible flag operations | §26 |
+| **Binary Protocol** | byteorder for endianness-aware parsing | §24 |
+| **Compression** | gzip/zstd with flate2 crate | §25, §40 |
+| **Atomic Operations** | Lock-free counters, compare-and-swap | §38 |
+| **Newtype Pattern** | Domain type wrappers preventing argument swapping | §34 |
+| **Provider Abstraction** | Testable HTTP clients with injectable base URLs | §29 |
+| **Testable NIFs** | Split NIF wrapper from internal logic | §30 |
+| **JSON Pointer** | Nested JSON extraction | §31 |
+| **with_context** | Rich error messages with anyhow context chains | §32 |
+| **Time Measurement** | NIF profiling with AtomicU64 metrics tracking | §33 |
+| **Round-Trip Testing** | Verify encode/decode consistency | §40 |
+| **Network/I/O Patterns** | Tokio runtime integration, blocking fetch | §39 |
+
+**Quick Reference - Atomic Ordering:**
+
+| Ordering | Use Case |
+|----------|----------|
+| `Relaxed` | Counters, statistics (no synchronization) |
+| `Acquire` | Reading shared data (pairs with Release) |
+| `Release` | Writing shared data (pairs with Acquire) |
+| `SeqCst` | When uncertain, or for CAS operations |
+
+## Navigation
+
+- **[reference.md](reference.md)** — Cargo.toml templates, complete type mapping tables, Env/OwnedEnv/Resource API reference, derive macro quick reference, lock patterns, thread patterns, data structure selection guide
+- **[examples.md](examples.md)** — 43 complete working examples from basic arithmetic to production patterns (sorted sets, monitoring, streaming iterators, Tokio integration, compression, state machines)
+- **[advanced.md](advanced.md)** — FFI fundamentals (CString, repr(C), raw pointers, linking), advanced threading (closure traits, scoped threads, channel pipelines, thread builders), module organization for large NIFs, string optimization, manual Term encoding (Encoder trait, keyword lists, dynamic maps), CI/CD for precompiled NIFs (GitHub Actions workflow)
+
+## Related Skills
+
+- **[rust-programming](../rust-programming/SKILL.md)** — General Rust patterns (ownership, traits, async/await, error handling, macros). Key: use `thiserror` for library errors, `anyhow` for application errors; prefer `impl Into<String>` over `String` parameters for ergonomic APIs.
+- **[elixir](../elixir/SKILL.md)** — Elixir language fundamentals. Key: prefer `with` chains for multi-step operations, use ok/error tuples not exceptions for expected failures.
+- **[elixir-testing](../elixir-testing/SKILL.md)** — ExUnit, Mox, property-based testing. Key: test NIF integration through ExUnit; use `assert_receive` for async NIF message testing.
+- **[otp](../otp/SKILL.md)** — Process architecture, supervision trees. Key: wrap NIF resources in GenServer for lifecycle management; supervisor can restart if NIF state becomes invalid.
+- **[c-programming](../c-programming/SKILL.md)** — C programming for FFI/embedded. Key: always use `#[repr(C)]` for structs passed across FFI boundaries; never use default Rust repr for C interop.
