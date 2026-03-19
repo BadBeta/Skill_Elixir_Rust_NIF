@@ -1044,6 +1044,4 @@ fn process_image_returns_expected_result() {
 
 - **[rust-programming](../rust-programming/SKILL.md)** — General Rust patterns (ownership, traits, async/await, error handling, macros). Key: use `thiserror` for library errors, `anyhow` for application errors; prefer `impl Into<String>` over `String` parameters for ergonomic APIs.
 - **[elixir](../elixir/SKILL.md)** — Elixir language fundamentals. Key: prefer `with` chains for multi-step operations, use ok/error tuples not exceptions for expected failures.
-- **[elixir-testing](../elixir-testing/SKILL.md)** — ExUnit, Mox, property-based testing. Key: test NIF integration through ExUnit; use `assert_receive` for async NIF message testing.
-- **[otp](../otp/SKILL.md)** — Process architecture, supervision trees. Key: wrap NIF resources in GenServer for lifecycle management; supervisor can restart if NIF state becomes invalid.
 - **[c-programming](../c-programming/SKILL.md)** — C programming for FFI/embedded. Key: always use `#[repr(C)]` for structs passed across FFI boundaries; never use default Rust repr for C interop.
