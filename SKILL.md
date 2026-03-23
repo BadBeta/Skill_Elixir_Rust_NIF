@@ -89,7 +89,9 @@ description: >
 
 15. **ALWAYS wrap NifMap NIFs** in Elixir functions that fill missing keys with `nil` — NifMap requires ALL keys present even for `Option<T>` fields
 
-16. **ALWAYS add `@spec` to every NIF binding function** — NIF stubs are the boundary between two type systems and are the most important functions to type. Every `def func(...), do: :erlang.nif_error(:nif_not_loaded)` must have a `@spec` above it. Define shared `@type` aliases when multiple NIFs take the same complex argument pattern
+16. **PREFER normalizing input values (case, encoding, trimming) at the Rust layer** rather than requiring Elixir callers to pre-process — the Rust side knows what the underlying library expects
+
+17. **ALWAYS add `@spec` to every NIF binding function** — NIF stubs are the boundary between two type systems and are the most important functions to type. Every `def func(...), do: :erlang.nif_error(:nif_not_loaded)` must have a `@spec` above it. Define shared `@type` aliases when multiple NIFs take the same complex argument pattern
     ```elixir
     # Define shared types for recurring NIF argument patterns
     @type point :: {float(), float()}
@@ -331,6 +333,15 @@ defmodule MyApp.Native do
   def add(_a, _b), do: :erlang.nif_error(:nif_not_loaded)
 end
 ```
+
+### Adding a New NIF Function to an Existing Crate
+
+When adding a function to a crate that already has NIFs:
+
+1. **Rust function** — Add `#[rustler::nif]` function in the appropriate `.rs` file
+2. **Register in `lib.rs`** — Add the function name to `rustler::init!("Elixir.MyApp.Native")` (forgetting this is the most common mistake — the NIF compiles but raises `:nif_not_loaded` at runtime)
+3. **Elixir stub** — Add `def my_func(...), do: :erlang.nif_error(:nif_not_loaded)` with `@spec` in the native module
+4. **Elixir wrapper** — Add the public API function in the appropriate context module
 
 ## 5. Type Encoding/Decoding
 
@@ -1043,5 +1054,14 @@ fn process_image_returns_expected_result() {
 ## Related Skills
 
 - **[rust-programming](../rust-programming/SKILL.md)** — General Rust patterns (ownership, traits, async/await, error handling, macros). Key: use `thiserror` for library errors, `anyhow` for application errors; prefer `impl Into<String>` over `String` parameters for ergonomic APIs.
-- **[elixir](../elixir/SKILL.md)** — Elixir language fundamentals. Key: prefer `with` chains for multi-step operations, use ok/error tuples not exceptions for expected failures.
+- **[elixir](../elixir/SKILL.md)** — Elixir language fundamentals and OTP. Key: prefer `with` chains for multi-step operations, use ok/error tuples not exceptions for expected failures. **Integration:** When your NIF library uses Registry-based process management, callers MUST use your `via()` helper to address processes — raw atom names won't resolve (see elixir skill Rule 14). Document your library's process discovery mechanism.
 - **[c-programming](../c-programming/SKILL.md)** — C programming for FFI/embedded. Key: always use `#[repr(C)]` for structs passed across FFI boundaries; never use default Rust repr for C interop.
+
+## Consuming NIF Libraries in Phoenix/Elixir Apps
+
+When a NIF library has its own OTP supervision tree (Registry, DynamicSupervisor, GenServers):
+
+1. **Application ordering** — The NIF library's application must start before your processes. Ensure it's in `deps` (automatic) or `extra_applications` (manual).
+2. **Process naming** — If the library registers processes via `{:via, Registry, ...}`, you MUST use the same via tuple to call them. Use the library's `via()` helper — never raw atom names.
+3. **Initialization dependencies** — If your GenServer's `handle_continue` calls into the library, use `:rest_for_one` supervision or ensure the library's tree is fully started.
+4. **Timeouts** — Cross-GenServer calls during initialization may need longer than the default 5000ms `GenServer.call` timeout. Use explicit timeouts for library operations during startup.
