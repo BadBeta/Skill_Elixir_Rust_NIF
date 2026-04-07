@@ -37,6 +37,21 @@ description: >
    }
    ```
 
+   ### Return Type Matrix — How Rustler Encodes Results
+
+   | Rust return type | Elixir sees | Correct? |
+   |---|---|---|
+   | `Result<Atom, E>` | `{:ok, :ok}` / `{:error, e}` | **BAD** — double-wrapped |
+   | `Result<(Atom, ResourceArc<T>), E>` | `{:ok, {:ok, ref}}` / `{:error, e}` | **BAD** — double-wrapped |
+   | `Result<ResourceArc<T>, E>` | `{:ok, ref}` / `{:error, e}` | Good |
+   | `Result<Vec<String>, E>` | `{:ok, ["..."]}` / `{:error, e}` | Good |
+   | `Result<bool, E>` | `{:ok, true}` / `{:error, e}` | Good |
+   | `Atom` | `:ok` | Good — for fire-and-forget |
+   | `ResourceArc<T>` | `ref` | Good — when it can't fail |
+   | `(Atom, Vec<String>)` | `{:ok, ["..."]}` | Good — tuple becomes tagged tuple |
+
+   **The rule:** `Result` wraps the `Ok` value in `{:ok, ...}`. If the `Ok` value is ALREADY a tagged atom (`:ok`, `{:ok, ref}`), you get double wrapping. Only put meaningful *data* in `Ok`.
+
 3. **ALWAYS return Result types** instead of panicking — a panic in a NIF crashes the entire BEAM VM
    ```rust
    fn example() -> Result<T, Atom>  // Not T directly if it can fail
@@ -106,6 +121,44 @@ description: >
             [point()]
           ) :: {:ok, map()} | {:error, String.t()}
     def compute(_matrix, _window, _points), do: :erlang.nif_error(:nif_not_loaded)
+    ```
+
+18. **NEVER return `Vec<u8>` to represent binary data** — Rustler encodes `Vec<u8>` as a *list of integers*, not a binary. Use `NewBinary` to return binary data to Elixir
+    ```rust
+    // BAD: Vec<u8> becomes [104, 101, 108, 108, 111] in Elixir (a list!)
+    fn compress(data: Binary) -> Vec<u8> {
+        do_compress(data.as_slice())
+    }
+
+    // GOOD: NewBinary becomes a proper Elixir binary
+    fn compress(env: Env, data: Binary) -> Binary {
+        let compressed = do_compress(data.as_slice());
+        let mut output = NewBinary::new(env, compressed.len());
+        output.as_mut_slice().copy_from_slice(&compressed);
+        output.into()
+    }
+    ```
+
+19. **ALWAYS enter the tokio runtime context in DirtyIo NIFs that construct async objects** — libraries like quinn (QUIC), mDNS, and other tokio-dependent crates panic with "there is no reactor running" if not inside a runtime context
+    ```rust
+    #[rustler::nif(schedule = "DirtyIo")]
+    fn create_node(config: Config) -> Result<ResourceArc<NodeHandle>, String> {
+        let runtime = RUNTIME.get().ok_or("runtime not initialized")?;
+        let _guard = runtime.enter();  // Establishes tokio context for this thread
+        // Now quinn::Endpoint::new(), mDNS, etc. can find the reactor
+        let node = build_node(config).map_err(|e| e.to_string())?;
+        Ok(ResourceArc::new(node))
+    }
+    ```
+
+20. **ALWAYS use `#[rustler::resource_impl]`** on `impl Resource` blocks — in Rustler 0.36+, bare `impl Resource for T {}` does NOT register the resource type and causes a runtime panic (`called Option::unwrap() on a None value`). The attribute macro performs the registration
+    ```rust
+    // BAD: compiles but panics at runtime — resource not registered
+    impl rustler::Resource for MyResource {}
+
+    // GOOD: attribute triggers resource registration
+    #[rustler::resource_impl]
+    impl rustler::Resource for MyResource {}
     ```
 
 ## 2. When to Use Rust NIFs
