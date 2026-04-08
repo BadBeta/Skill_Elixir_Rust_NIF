@@ -57,12 +57,25 @@ description: >
    fn example() -> Result<T, Atom>  // Not T directly if it can fail
    ```
 
-4. **ALWAYS use try_lock()** for ResourceArc mutex access, not lock() — blocking locks can deadlock the scheduler
+4. **PREFER clone-based immutability over mutex** for ResourceArc state. When mutex is needed, use `try_lock()` — blocking locks can deadlock the scheduler
    ```rust
+   // BEST: Clone-based immutability (Explorer pattern — no mutex, no deadlocks)
+   pub struct MyRef(pub MyData);
+   impl MyRef { pub fn clone_inner(&self) -> MyData { self.0.clone() } }
+   fn transform(res: ExMyData) -> Result<ExMyData, MyError> {
+       let mut data = res.clone_inner();  // Clone, mutate, return new resource
+       data.transform()?;
+       Ok(ExMyData::new(data))
+   }
+
+   // GOOD: try_lock with error return (Discord SortedSet pattern)
    match resource.data.try_lock() {
        Some(guard) => Ok(process(&guard)),
        None => Err(atoms::lock_fail()),
    }
+
+   // BAD: blocking lock — can deadlock the scheduler
+   let guard = resource.data.lock().unwrap();
    ```
 
 5. **ALWAYS use derive macros** for Elixir ↔ Rust type conversion
@@ -73,7 +86,7 @@ description: >
    #[derive(NifUnitEnum)]     // :atom
    ```
 
-6. **NEVER use `unwrap()` or `expect()`** in NIF code — convert to Result with `.ok_or()` or `?` operator
+6. **NEVER use `unwrap()` or `expect()`** in NIF function bodies — convert to Result with `.ok_or()` or `?` operator. For infallible conversions where `None`/`Err` is logically impossible, use `.expect("known valid: reason")` to document the invariant. On locks, always use `try_lock()` with error return, never `.lock().unwrap()`
 
 7. **ALWAYS design the Elixir API first** — write how you want to call it from Elixir, then implement the Rust NIF to match
 
@@ -85,7 +98,7 @@ description: >
    data.par_iter().map(|x| process(x)).collect()
    ```
 
-10. **ALWAYS use `parking_lot::Mutex`** over `std::sync::Mutex` — faster, smaller, no poisoning
+10. **PREFER `std::sync::Mutex`** (or avoid mutex entirely via clone-based immutability). No major production Rustler project (Explorer, Tokenizers, Discord SortedSet) uses `parking_lot` — all use `std::sync`. Consider `parking_lot` only if benchmarks show lock contention is a bottleneck
 
 11. **PREFER Elixir for network I/O** — only use Rust NIFs when you need a Rust-only library, heavy CPU processing of network data, or custom binary protocol parsing
 
@@ -106,21 +119,26 @@ description: >
 
 16. **PREFER normalizing input values (case, encoding, trimming) at the Rust layer** rather than requiring Elixir callers to pre-process — the Rust side knows what the underlying library expects
 
-17. **ALWAYS add `@spec` to every NIF binding function** — NIF stubs are the boundary between two type systems and are the most important functions to type. Every `def func(...), do: :erlang.nif_error(:nif_not_loaded)` must have a `@spec` above it. Define shared `@type` aliases when multiple NIFs take the same complex argument pattern
+17. **ALWAYS add `@spec` to public API functions that wrap NIFs** — the public-facing module (e.g., `MyApp.DataFrame`) must have specs on every function. The internal NIF stub module (`MyApp.Native`) may omit specs — Explorer and Tokenizers both skip specs on stubs and put them only on the public API. Define shared `@type` aliases when multiple functions take the same complex argument pattern
     ```elixir
-    # Define shared types for recurring NIF argument patterns
-    @type point :: {float(), float()}
+    # Public API module — ALWAYS has @spec
+    defmodule MyApp.DataFrame do
+      @type t :: %__MODULE__{resource: reference()}
+      @type column_name :: String.t() | atom()
 
-    @spec my_nif(arg_type(), other_type()) :: {:ok, result_type()} | {:error, String.t()}
-    def my_nif(_arg, _other), do: :erlang.nif_error(:nif_not_loaded)
+      @spec new(list()) :: {:ok, t()} | {:error, String.t()}
+      def new(data), do: Native.df_new(data)
 
-    # Multi-line @spec for functions with many parameters
-    @spec compute(
-            [[float()]],
-            non_neg_integer(),
-            [point()]
-          ) :: {:ok, map()} | {:error, String.t()}
-    def compute(_matrix, _window, _points), do: :erlang.nif_error(:nif_not_loaded)
+      @spec names(t()) :: {:ok, [String.t()]} | {:error, String.t()}
+      def names(df), do: Native.df_names(df)
+    end
+
+    # Native stub module — specs optional (internal module)
+    defmodule MyApp.Native do
+      use Rustler, otp_app: :my_app, crate: "my_nif"
+      def df_new(_data), do: :erlang.nif_error(:nif_not_loaded)
+      def df_names(_df), do: :erlang.nif_error(:nif_not_loaded)
+    end
     ```
 
 18. **NEVER return `Vec<u8>` to represent binary data** — Rustler encodes `Vec<u8>` as a *list of integers*, not a binary. Use `NewBinary` to return binary data to Elixir
@@ -160,6 +178,129 @@ description: >
     #[rustler::resource_impl]
     impl rustler::Resource for MyResource {}
     ```
+
+## 1b. Production Patterns (from Explorer, Tokenizers, Discord SortedSet)
+
+### Resource Wrapper Pattern (ResourceArc + NifStruct + Deref)
+
+The de facto standard for exposing Rust types to Elixir, used by Explorer (4 types) and Tokenizers (8+ types):
+
+```rust
+// 1. Inner resource — holds the actual data
+pub struct ExDataFrameRef(pub DataFrame);
+
+#[rustler::resource_impl]
+impl Resource for ExDataFrameRef {}
+
+// 2. NifStruct wrapper — this is what Elixir sees as %Module{}
+#[derive(NifStruct)]
+#[module = "MyApp.DataFrame"]
+pub struct ExDataFrame {
+    pub resource: ResourceArc<ExDataFrameRef>,
+}
+
+// 3. Deref for ergonomic access in NIF functions
+impl Deref for ExDataFrame {
+    type Target = DataFrame;
+    fn deref(&self) -> &Self::Target { &self.resource.0 }
+}
+
+// 4. Constructor
+impl ExDataFrame {
+    pub fn new(df: DataFrame) -> Self {
+        Self { resource: ResourceArc::new(ExDataFrameRef(df)) }
+    }
+}
+
+// 5. Clone for mutation (avoids mutex entirely)
+impl ExDataFrameRef {
+    pub fn clone_inner(&self) -> DataFrame { self.0.clone() }
+}
+```
+
+### Custom Error Type with thiserror + Encoder
+
+Used by Explorer and Tokenizers. Scales better than raw Atom errors for projects wrapping complex upstream libraries:
+
+```rust
+use thiserror::Error;
+
+#[derive(Debug, Error)]
+pub enum MyError {
+    #[error("upstream: {0}")]
+    Upstream(#[from] upstream::Error),  // auto-convert with ?
+    #[error("internal: {0}")]
+    Internal(String),
+    #[error("{0}")]
+    Other(String),
+}
+
+impl rustler::Encoder for MyError {
+    fn encode<'a>(&self, env: Env<'a>) -> Term<'a> {
+        format!("{self}").encode(env)  // Returns error string to Elixir
+    }
+}
+
+// Required for catch_unwind compatibility
+impl std::panic::RefUnwindSafe for MyError {}
+
+// All NIFs return Result<T, MyError> — clean ? operator chains
+#[rustler::nif(schedule = "DirtyCpu")]
+fn process(data: ExMyData) -> Result<ExMyData, MyError> {
+    let mut inner = data.clone_inner();
+    inner.transform()?;  // upstream::Error auto-converts via #[from]
+    Ok(ExMyData::new(inner))
+}
+```
+
+### catch_unwind for Upstream Libraries That May Panic
+
+When wrapping a Rust library that can panic (e.g., during training, parsing malformed data), use `catch_unwind` to convert panics to errors instead of crashing the BEAM:
+
+```rust
+use std::panic;
+
+#[rustler::nif(schedule = "DirtyCpu")]
+fn train(tokenizer: ExTokenizer, files: Vec<String>) -> Result<ExTokenizer, MyError> {
+    let result = panic::catch_unwind(|| {
+        let mut tok = tokenizer.resource.0.clone();
+        tok.train(&files).map_err(MyError::from)?;
+        Ok(tok)
+    });
+    match result {
+        Ok(Ok(tok)) => Ok(ExTokenizer::new(tok)),
+        Ok(Err(e)) => Err(e),
+        Err(panic_info) => Err(MyError::Internal(
+            format!("panic during training: {:?}", panic_info)
+        )),
+    }
+}
+```
+
+### Bare Return Types for Infallible Getters
+
+For simple property accessors that cannot fail, return the value directly without Result wrapping. This avoids unnecessary `{:ok, value}` on the Elixir side:
+
+```rust
+// GOOD: bare return for infallible getter — Elixir sees just the value
+#[rustler::nif]
+fn get_vocab_size(tokenizer: ExTokenizer) -> usize {
+    tokenizer.get_vocab_size(true)
+}
+
+// GOOD: Option for nullable getters — Elixir sees value or nil
+#[rustler::nif]
+fn get_model(tokenizer: ExTokenizer) -> Option<ExModel> {
+    tokenizer.get_model().map(ExModel::new)
+}
+
+// Use Result only when the operation can genuinely fail
+#[rustler::nif(schedule = "DirtyCpu")]
+fn encode(tokenizer: ExTokenizer, text: String) -> Result<ExEncoding, MyError> {
+    let enc = tokenizer.encode(text, true)?;
+    Ok(ExEncoding::new(enc))
+}
+```
 
 ## 2. When to Use Rust NIFs
 
