@@ -859,14 +859,16 @@ fn sorted_set_new() -> ResourceArc<SortedSet> {
 // Discord pattern: use try_lock() instead of lock()
 // Returns error instead of blocking/deadlocking
 #[rustler::nif]
-fn sorted_set_insert(set: ResourceArc<SortedSet>, value: i64) -> Result<Atom, Atom> {
+fn sorted_set_insert(set: ResourceArc<SortedSet>, value: i64) -> Result<bool, Atom> {
     match set.data.try_lock() {
         Some(mut data) => {
             match data.binary_search(&value) {
-                Ok(_) => {} // Already exists
-                Err(pos) => data.insert(pos, value),
+                Ok(_) => Ok(false), // Already existed
+                Err(pos) => {
+                    data.insert(pos, value);
+                    Ok(true) // Newly inserted
+                }
             }
-            Ok(atoms::ok())
         }
         None => Err(atoms::lock_fail()),
     }
@@ -916,7 +918,7 @@ defmodule MyApp.SortedSet do
 
   def insert(set, value, retries \\ 3) do
     case sorted_set_insert(set, value) do
-      {:ok, :ok} -> :ok
+      {:ok, _inserted} -> :ok
       {:error, :lock_fail} when retries > 0 ->
         Process.sleep(1)
         insert(set, value, retries - 1)
@@ -989,7 +991,7 @@ fn subscription_new() -> ResourceArc<Subscription> {
 }
 
 #[rustler::nif]
-fn subscribe(env: Env, sub: ResourceArc<Subscription>) -> Result<rustler::Atom, rustler::Atom> {
+fn subscribe(env: Env, sub: ResourceArc<Subscription>) -> Result<usize, rustler::Atom> {
     let pid = env.pid();
 
     // Monitor the calling process
@@ -997,7 +999,7 @@ fn subscribe(env: Env, sub: ResourceArc<Subscription>) -> Result<rustler::Atom, 
         Some(monitor) => {
             if let Some(mut subs) = sub.subscribers.try_lock() {
                 subs.insert(pid, monitor);
-                Ok(atoms::ok())
+                Ok(subs.len())  // Return subscriber count
             } else {
                 Err(atoms::error())
             }
@@ -1007,14 +1009,14 @@ fn subscribe(env: Env, sub: ResourceArc<Subscription>) -> Result<rustler::Atom, 
 }
 
 #[rustler::nif]
-fn unsubscribe(env: Env, sub: ResourceArc<Subscription>) -> Result<rustler::Atom, rustler::Atom> {
+fn unsubscribe(env: Env, sub: ResourceArc<Subscription>) -> Result<usize, rustler::Atom> {
     let pid = env.pid();
 
     if let Some(mut subs) = sub.subscribers.try_lock() {
         if let Some(monitor) = subs.remove(&pid) {
             env.demonitor(&sub, &monitor);
         }
-        Ok(atoms::ok())
+        Ok(subs.len())  // Return remaining subscriber count
     } else {
         Err(atoms::error())
     }
@@ -1044,7 +1046,7 @@ end
 # Usage
 iex> sub = MyApp.Subscription.subscription_new()
 iex> MyApp.Subscription.subscribe(sub)
-{:ok, :ok}
+{:ok, 1}
 iex> MyApp.Subscription.subscriber_count(sub)
 {:ok, 1}
 
@@ -1302,7 +1304,7 @@ fn df_add_column(
     df: ResourceArc<DataFrameResource>,
     name: String,
     data: Vec<f64>,
-) -> Result<Atom, Atom> {
+) -> Result<usize, Atom> {
     let mut guard = df.inner.try_write().ok_or(atoms::lock_fail())?;
 
     // Validate length
@@ -1313,7 +1315,7 @@ fn df_add_column(
     }
 
     guard.columns.push(Column { name, data });
-    Ok(atoms::ok())
+    Ok(guard.columns.len())  // Return new column count
 }
 
 // Heavy computation with parallel processing
@@ -2085,7 +2087,7 @@ fn buffer_push(
     timestamp: u64,
     value: f64,
     tag: String,
-) -> Result<Atom, Atom> {
+) -> Result<usize, Atom> {
     let mut events = buffer.events.try_lock().ok_or(atoms::lock_fail())?;
 
     // Remove oldest if at capacity
@@ -2094,7 +2096,7 @@ fn buffer_push(
     }
 
     events.push_back(Event { timestamp, value, tag });
-    Ok(atoms::ok())
+    Ok(events.len())  // Return current buffer size
 }
 
 #[rustler::nif]
@@ -2156,9 +2158,9 @@ end
 # Usage
 iex> buf = MyApp.EventBuffer.buffer_new(100)
 iex> MyApp.EventBuffer.buffer_push(buf, 1000, 42.5, "sensor_a")
-{:ok, :ok}
+{:ok, 1}
 iex> MyApp.EventBuffer.buffer_push(buf, 1001, 43.2, "sensor_a")
-{:ok, :ok}
+{:ok, 2}
 iex> MyApp.EventBuffer.buffer_sliding_average(buf, 10)
 {:ok, 42.85}
 ```
@@ -2747,10 +2749,10 @@ fn iterator_next(iter: ResourceArc<DataIterator>) -> Result<IteratorResult, Atom
 }
 
 #[rustler::nif]
-fn iterator_reset(iter: ResourceArc<DataIterator>) -> Result<Atom, Atom> {
+fn iterator_reset(iter: ResourceArc<DataIterator>) -> Result<usize, Atom> {
     let mut pos = iter.position.try_lock().ok_or(atoms::lock_fail())?;
     *pos = 0;
-    Ok(atoms::ok())
+    Ok(iter.data.len())  // Return total remaining items
 }
 
 #[rustler::nif]
@@ -4247,6 +4249,8 @@ fn conn_new(host: String, port: u16) -> ResourceArc<DynamicConnection> {
 }
 
 #[rustler::nif]
+// NOTE: Result<Atom, Atom> is OK here because Ok returns the NEW STATE (:connected),
+// not :ok. See Rule 2 — only `Ok(atoms::ok())` causes double-wrapping.
 fn conn_connect(conn: ResourceArc<DynamicConnection>) -> Result<Atom, Atom> {
     let mut state = conn.state.try_lock().ok_or(atoms::error())?;
 
@@ -4258,9 +4262,9 @@ fn conn_connect(conn: ResourceArc<DynamicConnection>) -> Result<Atom, Atom> {
                     .unwrap()
                     .as_secs(),
             };
-            Ok(atoms::ok())
+            Ok(atoms::connected())  // Return new state, not :ok
         }
-        ConnectionState::Connected { .. } => Ok(atoms::ok()),
+        ConnectionState::Connected { .. } => Ok(atoms::connected()),
         _ => Err(atoms::invalid_state()),
     }
 }
@@ -4286,9 +4290,9 @@ fn conn_authenticate(
                 session_id: format!("sess_{}", token),
                 user,
             };
-            Ok(atoms::ok())
+            Ok(atoms::authenticated())  // Return new state, not :ok
         }
-        ConnectionState::Authenticated { .. } => Ok(atoms::ok()),
+        ConnectionState::Authenticated { .. } => Ok(atoms::authenticated()),
         _ => Err(atoms::invalid_state()),
     }
 }
@@ -4433,7 +4437,7 @@ fn execute_transaction(
     conn: ResourceArc<Connection>,
     ops: Vec<String>,
     should_fail: bool,
-) -> Result<Atom, Atom> {
+) -> Result<usize, Atom> {
     let guard = TransactionGuard::new(&conn)?;
 
     for op in ops {
@@ -4445,8 +4449,9 @@ fn execute_transaction(
         }
     }
 
+    let op_count = conn.operations.lock().unwrap().len();
     guard.commit()?;
-    Ok(atoms::ok())
+    Ok(op_count)  // Return number of operations committed
 }
 
 #[rustler::nif]
@@ -4542,23 +4547,15 @@ fn counter_increment_if_below_max(counter: ResourceArc<AtomicCounter>) -> Result
 
 // Atomic flag toggle with return of previous value
 #[rustler::nif]
-fn counter_deactivate(counter: ResourceArc<AtomicCounter>) -> Result<Atom, Atom> {
+fn counter_deactivate(counter: ResourceArc<AtomicCounter>) -> Result<bool, Atom> {
     let was_active = counter.active.swap(false, Ordering::SeqCst);
-    if was_active {
-        Ok(atoms::ok())
-    } else {
-        Err(atoms::not_active())
-    }
+    Ok(was_active)  // Return previous state: true = was active, false = was already inactive
 }
 
 #[rustler::nif]
-fn counter_activate(counter: ResourceArc<AtomicCounter>) -> Result<Atom, Atom> {
+fn counter_activate(counter: ResourceArc<AtomicCounter>) -> Result<bool, Atom> {
     let was_active = counter.active.swap(true, Ordering::SeqCst);
-    if was_active {
-        Err(atoms::already_active())
-    } else {
-        Ok(atoms::ok())
-    }
+    Ok(!was_active)  // Return true if newly activated, false if was already active
 }
 
 #[rustler::nif]
