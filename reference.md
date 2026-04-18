@@ -331,16 +331,10 @@ fn async_example(caller_pid: LocalPid) {
 use rustler::{Env, LocalPid};
 use rustler::resource::Monitor;
 
+// The #[rustler::resource_impl] macro MUST go on the impl Resource block.
+// It auto-generates IMPLEMENTS_* constants by detecting which callback functions are present.
+#[rustler::resource_impl]
 impl rustler::Resource for MyResource {
-    // Enable destructor callback (default: false)
-    const IMPLEMENTS_DESTRUCTOR: bool = false;
-
-    // Enable process monitoring callback (default: false)
-    const IMPLEMENTS_DOWN: bool = false;
-
-    // Enable dynamic calls (default: false)
-    const IMPLEMENTS_DYNCALL: bool = false;
-
     // Called before resource is deallocated
     // Useful when cleanup needs Env (e.g., sending messages)
     fn destructor(self, env: Env) {
@@ -357,10 +351,6 @@ impl rustler::Resource for MyResource {
         // Handle dynamic call
     }
 }
-
-// Required: register the resource implementation
-#[rustler::resource_impl]
-impl MyResource {}
 ```
 
 ## 9. Error Types Reference

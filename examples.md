@@ -966,8 +966,9 @@ struct Subscription {
     subscribers: Mutex<HashMap<LocalPid, Monitor>>,
 }
 
+#[rustler::resource_impl]
 impl rustler::Resource for Subscription {
-    const IMPLEMENTS_DOWN: bool = true;
+    // No manual IMPLEMENTS_DOWN needed — the macro detects `down` and sets it automatically
 
     fn down<'a>(&'a self, env: Env<'a>, pid: LocalPid, _mon: Monitor) {
         // Called when a monitored process dies
@@ -979,9 +980,6 @@ impl rustler::Resource for Subscription {
         println!("Process {:?} terminated", pid);
     }
 }
-
-#[rustler::resource_impl]
-impl Subscription {}
 
 #[rustler::nif]
 fn subscription_new() -> ResourceArc<Subscription> {

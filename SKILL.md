@@ -169,14 +169,24 @@ description: >
     }
     ```
 
-20. **ALWAYS use `#[rustler::resource_impl]`** on `impl Resource` blocks — in Rustler 0.36+, bare `impl Resource for T {}` does NOT register the resource type and causes a runtime panic (`called Option::unwrap() on a None value`). The attribute macro performs the registration
+20. **ALWAYS use `#[rustler::resource_impl]`** on `impl Resource for T` blocks — in Rustler 0.36+, bare `impl Resource for T {}` does NOT register the resource type and causes a runtime panic (`called Option::unwrap() on a None value`). The attribute macro performs registration AND auto-generates `IMPLEMENTS_*` constants by detecting which callback functions (`down`, `destructor`, `dyncall`) are present — never set these booleans manually.
     ```rust
     // BAD: compiles but panics at runtime — resource not registered
     impl rustler::Resource for MyResource {}
 
-    // GOOD: attribute triggers resource registration
+    // BAD: macro on bare impl can't see callbacks, won't set IMPLEMENTS_DOWN
+    impl rustler::Resource for MyResource {
+        const IMPLEMENTS_DOWN: bool = true; // manual — fragile, unnecessary
+        fn down<'a>(&'a self, env: Env<'a>, pid: LocalPid, mon: Monitor) { }
+    }
     #[rustler::resource_impl]
-    impl rustler::Resource for MyResource {}
+    impl MyResource {}
+
+    // GOOD: macro on Resource impl — detects `down`, auto-sets IMPLEMENTS_DOWN
+    #[rustler::resource_impl]
+    impl rustler::Resource for MyResource {
+        fn down<'a>(&'a self, env: Env<'a>, pid: LocalPid, mon: Monitor) { }
+    }
     ```
 
 ## 1b. Production Patterns (from Explorer, Tokenizers, Discord SortedSet)
@@ -1057,8 +1067,9 @@ struct Session {
     data: Mutex<Vec<String>>,
 }
 
+#[rustler::resource_impl]
 impl rustler::Resource for Session {
-    const IMPLEMENTS_DOWN: bool = true;
+    // No manual IMPLEMENTS_DOWN needed — the macro detects `down` and sets it automatically
 
     fn down<'a>(&'a self, _env: Env<'a>, pid: LocalPid, _mon: Monitor) {
         println!("Process {:?} died, cleaning up...", pid);
@@ -1067,9 +1078,6 @@ impl rustler::Resource for Session {
         }
     }
 }
-
-#[rustler::resource_impl]
-impl Session {}
 
 #[rustler::nif]
 fn monitor_caller(env: Env, session: ResourceArc<Session>) -> bool {
