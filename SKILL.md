@@ -1202,6 +1202,17 @@ Full type-mapping with edge cases lives in [reference.md §4](reference.md).
 use rustler::{NifStruct, NifMap, NifTuple, NifTaggedEnum, NifUnitEnum};
 
 // Elixir: %MyApp.User{name: "Alice", age: 30}
+//
+// IMPORTANT: do NOT include the "Elixir." prefix in `#[module = "..."]`.
+// Rustler prepends it automatically. Writing `#[module = "Elixir.MyApp.User"]`
+// produces `__struct__: Elixir.Elixir.MyApp.User` and the Elixir caller
+// gets a `%{}` map with that broken atom — pattern matches against
+// `%MyApp.User{}` silently fail to bind.
+//
+// Asymmetry to remember: `rustler::init!("Elixir.MyApp.Native")` DOES need
+// the prefix; the NifStruct attribute does NOT. The hook
+// `nif-module-elixir-prefix` (in bb-anti-slop-patterns.json) catches the
+// prefix mistake at write time.
 #[derive(NifStruct)]
 #[module = "MyApp.User"]
 struct User {
@@ -1312,7 +1323,12 @@ enum NifError {
     NotFound(String),
 }
 
-// Convert custom errors to Rustler errors
+// Convert custom errors to Rustler errors. Two variants — pick by intent:
+//   - rustler::Error::Term(_)      → returns {:error, encoded} on Elixir side
+//   - rustler::Error::RaiseTerm(_) → raises ErlangError with the term
+//   - rustler::Error::RaiseAtom(_) → raises ErlangError with the atom
+// For NIFs declared as `Result<T, NifError>` (with NifError: Encoder),
+// use Error::Term — the function is "tuple-shape" and Elixir gets a tuple.
 impl From<NifError> for rustler::Error {
     fn from(e: NifError) -> Self {
         rustler::Error::Term(Box::new(e.to_string()))
@@ -1330,6 +1346,55 @@ fn complex_operation(input: String) -> Result<i64, NifError> {
     Ok(value * 2)
 }
 ```
+
+### `Error::Term` vs `Error::RaiseTerm` — the trap that bites NifResult
+
+The skill says repeatedly "NifResult raises on Err" — true, but **only if the
+`Err` value uses the `Raise*` variants**. The bare `Error::Term(Box::new(_))`
+shown in some examples does NOT raise; it encodes as `{:error, term}` on the
+Elixir side. This produces silently-wrong behavior in `!`-style NIFs:
+
+```rust
+// BAD: NifResult signature suggests "raises on err", but Error::Term
+//      actually encodes as {:error, _}. Elixir's `assert_raise` won't
+//      fire; `put!/3` returns a tuple instead of raising.
+impl From<MyError> for rustler::Error {
+    fn from(e: MyError) -> Self {
+        rustler::Error::Term(Box::new(e.to_atom()))   // ← encodes, doesn't raise
+    }
+}
+#[rustler::nif]
+fn put(arr: ResourceArc<R>, i: usize, v: f64) -> NifResult<Atom> {
+    array::put(&arr, i, v)?;   // ?-converts MyError → Error::Term — returns tuple!
+    Ok(atoms::ok())
+}
+```
+
+```rust
+// GOOD: RaiseTerm actually raises. NifResult<Atom> + Ok(atoms::ok())
+//       gives Elixir a clean :ok on success, ErlangError on failure.
+impl From<MyError> for rustler::Error {
+    fn from(e: MyError) -> Self {
+        rustler::Error::RaiseTerm(Box::new(e.to_atom()))   // ← raises
+    }
+}
+```
+
+The variants in full:
+
+| `rustler::Error` variant | Behavior on Elixir side |
+|---|---|
+| `Term(Box<dyn Encoder>)` | Returns `{:error, encoded_term}` — **does NOT raise** |
+| `RaiseTerm(Box<dyn Encoder>)` | Raises `ErlangError` with the term as `:reason` |
+| `RaiseAtom(&'static str)` | Raises `ErlangError` with the atom as `:reason` |
+| `BadArg` | Raises `:badarg` |
+| `Atom(&'static str)` | Returns `{:error, atom}` — same shape as `Term` |
+
+**Rule of thumb:** if the NIF's return type is `NifResult<T>` AND you want
+`assert_raise ErlangError` to actually fire on the Elixir side, the `From`
+impl MUST use `RaiseTerm` or `RaiseAtom`. `Error::Term` is for the
+"fall back to `Result<T, MyError>` returns tuple" path, not the
+NifResult-raises path.
 
 ### Option Handling
 
