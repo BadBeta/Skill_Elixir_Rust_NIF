@@ -13,13 +13,6 @@ description: >
 
 # Rust NIFs with Rustler
 
-**Scope — what this skill does NOT cover:**
-
-- General Rust programming (ownership patterns beyond NIF-relevant ones, async design, macro systems, trait coherence) → load `rust-implementing` (or `rust-planning` / `rust-reviewing` for the matching phase).
-- Cross-language protocol design (wire format, schema evolution, versioning between BEAM and non-BEAM services) → design it in `elixir-planning` first, then apply here.
-- Rust WASM for browsers, Tauri desktop integration → load `rust-wasm` / `tauri-elixir`.
-- libp2p wrapped via NIFs specifically → load `libp2p` (it has its own NIF guidance).
-
 This skill covers the Elixir-side Rust integration (Rustler, ResourceArc, scheduler, panic safety, type encoding). Load `rust-implementing` alongside for the Rust language itself.
 
 ## About this skill — three phases of NIF work
@@ -1792,3 +1785,8 @@ When a NIF library has its own OTP supervision tree (Registry, DynamicSupervisor
 1. **Application ordering** — The NIF library's application must start before your processes. Ensure it's in `deps` (automatic) or `extra_applications` (manual).
 2. **Process naming** — If the library registers processes via `{:via, Registry, ...}`, you MUST use the same via tuple to call them. Use the library's `via()` helper — never raw atom names.
 3. **Initialization dependencies** — If your GenServer's `handle_continue` calls into the library, use `:rest_for_one` supervision or ensure the library's tree is fully started.
+
+## Scope — what this skill does NOT cover
+
+- General Rust programming (ownership patterns beyond NIF-relevant ones, async design, macro systems, trait coherence) → load `rust-implementing` (or `rust-planning` / `rust-reviewing` for the matching phase).
+- Cross-language protocol design (wire format, schema evolution, versioning between BEAM and non-BEAM services) → design it in `elixir-planning` first, then apply here.
